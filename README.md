@@ -4,8 +4,7 @@
  - Monte Carlo replications: 50
  - Forecast horizons: 1, 3, 6, 12
  - Regimes: linear AR(2), nonlinear threshold AR, structural break, heteroskedastic AR-GARCH
- - Methods: Simple Average, Bates-Granger, Granger-Ramanathan,
-#   Bayesian/Dynamic Model Averaging, Super Learner, XGBoost Stacking
+ - Methods used were: Simple Average, Bates-Granger, Granger-Ramanathan, Bayesian/Dynamic Model Averaging, Super Learner, XGBoost Stacking
 
 # Outputs:
 - simulation_detailed_metrics.csv
