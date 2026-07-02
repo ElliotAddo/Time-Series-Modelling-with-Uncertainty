@@ -15,7 +15,7 @@
 # XGBoost Stacking; otherwise, a small nonlinear boosted-stump fallback is used.
 
 CONFIG <- list(
-  sample_sizes = c(200, 500, 1000),
+  sample_sizes = c(100,300, 500,700, 1000),
   horizons = c(1, 3, 6, 12),
   regimes = c("linear_ar2", "nonlinear_threshold", "structural_break", "heteroskedastic"),
   replications = 50,
@@ -395,6 +395,10 @@ mae <- function(errors) mean(abs(errors))
 mase <- function(errors, train_y) mean(abs(errors)) / max(mean(abs(diff(train_y))), 1e-10)
 
 diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
+  finite_rows <- is.finite(errors_a) & is.finite(errors_b)
+  errors_a <- errors_a[finite_rows]
+  errors_b <- errors_b[finite_rows]
+  
   if (loss == "absolute") {
     loss_a <- abs(errors_a)
     loss_b <- abs(errors_b)
@@ -405,9 +409,13 @@ diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
   
   d <- loss_a - loss_b
   n <- length(d)
+  if (n < 2 || !any(is.finite(d))) {
+    return(NA_real_)
+  }
+  
   mean_d <- mean(d)
   centered <- d - mean_d
-  max_lag <- max(h - 1, 0)
+  max_lag <- min(max(h - 1, 0), n - 1)
   long_run_var <- sum(centered^2) / n
   
   if (max_lag > 0) {
@@ -419,23 +427,11 @@ diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
   }
   
   if (!is.finite(long_run_var) || long_run_var <= 1e-14) {
-    dm_stat <- 0
-    p_value <- 1
+    return(1)
   } else {
     dm_stat <- mean_d / sqrt(long_run_var / n)
-    p_value <- 2 * (1 - pnorm(abs(dm_stat)))
+    return(2 * (1 - pnorm(abs(dm_stat))))
   }
-  
-  favored <- if (mean_d < 0) "method_a" else if (mean_d > 0) "method_b" else "tie"
-  data.frame(
-    loss = loss,
-    mean_loss_diff = mean_d,
-    dm_stat = dm_stat,
-    p_value = p_value,
-    significant_5pct = p_value < 0.05,
-    favored_method = favored,
-    stringsAsFactors = FALSE
-  )
 }
 
 evaluate_replication <- function(y, initial_train_size, h, predictions, actual, elapsed,
@@ -471,23 +467,22 @@ evaluate_replication <- function(y, initial_train_size, h, predictions, actual, 
     pairs <- combn(METHODS, 2, simplify = FALSE)
     for (pair in pairs) {
       for (loss_name in c("squared", "absolute")) {
-        test <- diebold_mariano(
+        p_value <- diebold_mariano(
           errors_by_method[[pair[1]]],
           errors_by_method[[pair[2]]],
           h,
           loss = loss_name
         )
-        dm_rows[[idx]] <- cbind(
-          data.frame(
-            regime = ids$regime,
-            sample_size = ids$sample_size,
-            horizon = ids$horizon,
-            replication = ids$replication,
-            method_a = pair[1],
-            method_b = pair[2],
-            stringsAsFactors = FALSE
-          ),
-          test
+        dm_rows[[idx]] <- data.frame(
+          regime = ids$regime,
+          sample_size = ids$sample_size,
+          horizon = ids$horizon,
+          replication = ids$replication,
+          method_a = pair[1],
+          method_b = pair[2],
+          loss = loss_name,
+          p_value = p_value,
+          stringsAsFactors = FALSE
         )
         idx <- idx + 1
       }
@@ -617,27 +612,14 @@ print_dm_benchmark_summary <- function(dm_summary, benchmark = "SA") {
     benchmark_rows$method_b,
     benchmark_rows$method_a
   )
-  benchmark_rows$share_favoring_comparison <- ifelse(
-    benchmark_rows$method_a == benchmark,
-    benchmark_rows$share_favoring_method_b,
-    benchmark_rows$share_favoring_method_a
-  )
-  benchmark_rows$share_favoring_benchmark <- ifelse(
-    benchmark_rows$method_a == benchmark,
-    benchmark_rows$share_favoring_method_a,
-    benchmark_rows$share_favoring_method_b
-  )
   
   display <- benchmark_rows[, c(
     "regime",
     "sample_size",
     "horizon",
     "comparison_method",
-    "mean_dm_stat",
     "mean_p_value",
-    "rejection_rate_5pct",
-    "share_favoring_comparison",
-    "share_favoring_benchmark"
+    "rejection_rate_5pct"
   )]
   display <- display[order(display$regime, display$sample_size, display$horizon,
                            display$comparison_method), ]
@@ -646,6 +628,7 @@ print_dm_benchmark_summary <- function(dm_summary, benchmark = "SA") {
   cat("============================================================\n")
   cat("Diebold-Mariano Test Summary\n")
   cat("Benchmark:", benchmark, "| Loss: squared error\n")
+  cat("Lower p-values indicate stronger evidence of unequal predictive accuracy.\n")
   cat("============================================================\n")
   print(display, row.names = FALSE)
   invisible(display)
@@ -664,11 +647,8 @@ summarize_dm <- function(dm_rows) {
       method_b = dat$method_b[1],
       loss = dat$loss[1],
       replications = nrow(dat),
-      mean_dm_stat = mean(dat$dm_stat),
-      mean_p_value = mean(dat$p_value),
-      rejection_rate_5pct = mean(dat$significant_5pct),
-      share_favoring_method_a = mean(dat$favored_method == "method_a"),
-      share_favoring_method_b = mean(dat$favored_method == "method_b"),
+      mean_p_value = mean(dat$p_value, na.rm = TRUE),
+      rejection_rate_5pct = mean(dat$p_value < 0.05, na.rm = TRUE),
       stringsAsFactors = FALSE
     )
   })
@@ -733,7 +713,7 @@ run_study <- function(config) {
         }
         
         message(sprintf(
-          "completed regime=%s, T=%s, replication=%s/%s",
+          "completed regime=%s, n=%s, replication=%s/%s",
           regime, sample_size, replication, config$replications
         ))
       }
@@ -754,8 +734,8 @@ run_study <- function(config) {
 }
 
 # To do a very small smoke test before the full run, uncomment these lines:
-CONFIG$sample_sizes <- c(200)
-CONFIG$horizons <- c(1, 3)
-CONFIG$replications <- 2
+CONFIG$sample_sizes <- c(100,300,500,700,1000)
+CONFIG$horizons <- c(1, 3, 6, 12)
+CONFIG$replications <- 50
 
 results <- run_study(CONFIG)
