@@ -1,7 +1,7 @@
 # Simulation study for forecast-combination methods under model uncertainty
 #
 # This script implements the Chapter 3 methodology:
-# - Sample sizes: 200, 500, 1000
+# - Sample sizes: 100, 200, 500, 1000
 # - Monte Carlo replications: 50
 # - Forecast horizons: 1, 3, 6, 12
 # - Regimes: linear AR(2), nonlinear threshold AR, structural break, heteroskedastic AR-GARCH
@@ -9,19 +9,20 @@
 #   Bayesian/Dynamic Model Averaging, Super Learner, XGBoost Stacking
 #
 # Output:
-# - ranked mean metric tables printed directly in R, grouped by regime.
+# - ranked mean metric tables printed directly in R, grouped by regime and sample size.
+# - Diebold-Mariano p-value summaries printed and returned by sample size.
 #
 # The script uses base R. If the xgboost package is installed, it is used for
 # XGBoost Stacking; otherwise, a small nonlinear boosted-stump fallback is used.
 
 CONFIG <- list(
-  sample_sizes = c(100,300, 500,700, 1000),
+  sample_sizes = c(100, 300, 500,700, 1000),
   horizons = c(1, 3, 6, 12),
   regimes = c("linear_ar2", "nonlinear_threshold", "structural_break", "heteroskedastic"),
   replications = 50,
   seed = 20260629,
   train_fraction = 0.50,
-  min_training_size = 80,
+  min_training_size = 50,
   min_meta_train = 25,
   bg_error_window = 50,
   dma_forgetting_factor = 0.97,
@@ -29,8 +30,7 @@ CONFIG <- list(
   xgb_nrounds = 40,
   xgb_eta = 0.05,
   ranking_metric = "mean_rmse",
-  include_dm_tests = TRUE,
-  dm_benchmark = "SA"
+  include_dm_tests = TRUE
 )
 
 METHODS <- c("SA", "BG", "GR", "BMA_DMA", "SL", "XGB_STACK")
@@ -395,10 +395,6 @@ mae <- function(errors) mean(abs(errors))
 mase <- function(errors, train_y) mean(abs(errors)) / max(mean(abs(diff(train_y))), 1e-10)
 
 diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
-  finite_rows <- is.finite(errors_a) & is.finite(errors_b)
-  errors_a <- errors_a[finite_rows]
-  errors_b <- errors_b[finite_rows]
-  
   if (loss == "absolute") {
     loss_a <- abs(errors_a)
     loss_b <- abs(errors_b)
@@ -409,13 +405,9 @@ diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
   
   d <- loss_a - loss_b
   n <- length(d)
-  if (n < 2 || !any(is.finite(d))) {
-    return(NA_real_)
-  }
-  
   mean_d <- mean(d)
   centered <- d - mean_d
-  max_lag <- min(max(h - 1, 0), n - 1)
+  max_lag <- max(h - 1, 0)
   long_run_var <- sum(centered^2) / n
   
   if (max_lag > 0) {
@@ -427,11 +419,23 @@ diebold_mariano <- function(errors_a, errors_b, h, loss = "squared") {
   }
   
   if (!is.finite(long_run_var) || long_run_var <= 1e-14) {
-    return(1)
+    dm_stat <- 0
+    p_value <- 1
   } else {
     dm_stat <- mean_d / sqrt(long_run_var / n)
-    return(2 * (1 - pnorm(abs(dm_stat))))
+    p_value <- 2 * (1 - pnorm(abs(dm_stat)))
   }
+  
+  favored <- if (mean_d < 0) "method_a" else if (mean_d > 0) "method_b" else "tie"
+  data.frame(
+    loss = loss,
+    mean_loss_diff = mean_d,
+    dm_stat = dm_stat,
+    p_value = p_value,
+    significant_5pct = p_value < 0.05,
+    favored_method = favored,
+    stringsAsFactors = FALSE
+  )
 }
 
 evaluate_replication <- function(y, initial_train_size, h, predictions, actual, elapsed,
@@ -467,22 +471,23 @@ evaluate_replication <- function(y, initial_train_size, h, predictions, actual, 
     pairs <- combn(METHODS, 2, simplify = FALSE)
     for (pair in pairs) {
       for (loss_name in c("squared", "absolute")) {
-        p_value <- diebold_mariano(
+        test <- diebold_mariano(
           errors_by_method[[pair[1]]],
           errors_by_method[[pair[2]]],
           h,
           loss = loss_name
         )
-        dm_rows[[idx]] <- data.frame(
-          regime = ids$regime,
-          sample_size = ids$sample_size,
-          horizon = ids$horizon,
-          replication = ids$replication,
-          method_a = pair[1],
-          method_b = pair[2],
-          loss = loss_name,
-          p_value = p_value,
-          stringsAsFactors = FALSE
+        dm_rows[[idx]] <- cbind(
+          data.frame(
+            regime = ids$regime,
+            sample_size = ids$sample_size,
+            horizon = ids$horizon,
+            replication = ids$replication,
+            method_a = pair[1],
+            method_b = pair[2],
+            stringsAsFactors = FALSE
+          ),
+          test
         )
         idx <- idx + 1
       }
@@ -519,8 +524,8 @@ summarize_metrics <- function(metric_rows) {
       mean_mae = mean(dat$mae),
       sd_mae = sd(dat$mae),
       mean_mase = mean(dat$mase),
-      mean_r_rmse = mean(dat$relative_rmse),
-      mean_comp_time = mean(dat$computation_time_seconds),
+      mean_relative_rmse = mean(dat$relative_rmse),
+      mean_computation_time_seconds = mean(dat$computation_time_seconds),
       rmse_win_rate = mean(dat$win),
       stringsAsFactors = FALSE
     )
@@ -529,7 +534,7 @@ summarize_metrics <- function(metric_rows) {
 }
 
 rank_mean_metrics_by_regime <- function(metric_rows) {
-  group_cols <- c("regime", "method")
+  group_cols <- c("regime", "sample_size", "method")
   
   win_keys <- paste(metric_rows$regime, metric_rows$sample_size, metric_rows$horizon,
                     metric_rows$replication, sep = "|")
@@ -546,40 +551,42 @@ rank_mean_metrics_by_regime <- function(metric_rows) {
   ranked <- lapply(groups, function(dat) {
     data.frame(
       regime = dat$regime[1],
+      sample_size = dat$sample_size[1],
       method = dat$method[1],
-      n = paste(sort(unique(dat$sample_size)), collapse = ", "),
       horizons_used = paste(sort(unique(dat$horizon)), collapse = ", "),
       replications_per_setting = length(unique(dat$replication)),
       mean_rmse = mean(dat$rmse),
       mean_mae = mean(dat$mae),
       mean_mase = mean(dat$mase),
-      mean_r_rmse = mean(dat$relative_rmse),
-      mean_comp_time = mean(dat$computation_time_seconds),
+      mean_relative_rmse = mean(dat$relative_rmse),
+      mean_computation_time_seconds = mean(dat$computation_time_seconds),
       rmse_win_rate = mean(dat$win),
       stringsAsFactors = FALSE
     )
   })
   
   ranked <- do.call(rbind, ranked)
-  ranked <- ranked[order(ranked$regime, ranked$mean_rmse, ranked$mean_mae), ]
+  ranked <- ranked[order(ranked$regime, ranked$sample_size, ranked$mean_rmse,
+                         ranked$mean_mae), ]
+  rank_group <- paste(ranked$regime, ranked$sample_size, sep = "|")
   ranked$rank <- ave(
     ranked$mean_rmse,
-    ranked$regime,
+    rank_group,
     FUN = function(x) rank(x, ties.method = "first")
   )
-  ranked <- ranked[order(ranked$regime, ranked$rank), ]
+  ranked <- ranked[order(ranked$regime, ranked$sample_size, ranked$rank), ]
   rownames(ranked) <- NULL
   ranked[, c(
     "regime",
+    "sample_size",
     "rank",
     "method",
     "mean_rmse",
     "mean_mae",
     "mean_mase",
-    "mean_r_rmse",
-    "mean_comp_time",
+    "mean_relative_rmse",
+    "mean_computation_time_seconds",
     "rmse_win_rate",
-    "n",
     "horizons_used",
     "replications_per_setting"
   )]
@@ -587,14 +594,40 @@ rank_mean_metrics_by_regime <- function(metric_rows) {
 
 print_ranked_regime_tables <- function(ranked_metrics) {
   for (regime_name in unique(ranked_metrics$regime)) {
-    cat("\n")
-    cat("============================================================\n")
-    cat("Regime:", regime_name, "\n")
-    cat("Ranked by lowest mean RMSE\n")
-    cat("============================================================\n")
-    regime_table <- ranked_metrics[ranked_metrics$regime == regime_name, ]
-    print(regime_table, row.names = FALSE)
+    for (n_value in sort(unique(ranked_metrics$sample_size[ranked_metrics$regime == regime_name]))) {
+      cat("\n")
+      cat("============================================================\n")
+      cat("Regime:", regime_name, "| Sample size n =", n_value, "\n")
+      cat("Ranked by lowest mean RMSE\n")
+      cat("============================================================\n")
+      regime_table <- ranked_metrics[
+        ranked_metrics$regime == regime_name & ranked_metrics$sample_size == n_value,
+      ]
+      print(regime_table, row.names = FALSE)
+    }
   }
+}
+
+print_best_models_by_sample_size <- function(ranked_metrics) {
+  best_models <- ranked_metrics[ranked_metrics$rank == 1, ]
+  best_models <- best_models[order(best_models$regime, best_models$sample_size), ]
+  
+  cat("\n")
+  cat("============================================================\n")
+  cat("Best Model Under Each Regime and Sample Size\n")
+  cat("============================================================\n")
+  print(best_models[, c(
+    "regime",
+    "sample_size",
+    "method",
+    "mean_rmse",
+    "mean_mae",
+    "mean_mase",
+    "mean_relative_rmse",
+    "rmse_win_rate"
+  )], row.names = FALSE)
+  
+  invisible(best_models)
 }
 
 print_dm_benchmark_summary <- function(dm_summary, benchmark = "SA") {
@@ -612,14 +645,27 @@ print_dm_benchmark_summary <- function(dm_summary, benchmark = "SA") {
     benchmark_rows$method_b,
     benchmark_rows$method_a
   )
+  benchmark_rows$share_favoring_comparison <- ifelse(
+    benchmark_rows$method_a == benchmark,
+    benchmark_rows$share_favoring_method_b,
+    benchmark_rows$share_favoring_method_a
+  )
+  benchmark_rows$share_favoring_benchmark <- ifelse(
+    benchmark_rows$method_a == benchmark,
+    benchmark_rows$share_favoring_method_a,
+    benchmark_rows$share_favoring_method_b
+  )
   
   display <- benchmark_rows[, c(
     "regime",
     "sample_size",
     "horizon",
     "comparison_method",
+    "mean_dm_stat",
     "mean_p_value",
-    "rejection_rate_5pct"
+    "rejection_rate_5pct",
+    "share_favoring_comparison",
+    "share_favoring_benchmark"
   )]
   display <- display[order(display$regime, display$sample_size, display$horizon,
                            display$comparison_method), ]
@@ -628,10 +674,51 @@ print_dm_benchmark_summary <- function(dm_summary, benchmark = "SA") {
   cat("============================================================\n")
   cat("Diebold-Mariano Test Summary\n")
   cat("Benchmark:", benchmark, "| Loss: squared error\n")
-  cat("Lower p-values indicate stronger evidence of unequal predictive accuracy.\n")
   cat("============================================================\n")
   print(display, row.names = FALSE)
   invisible(display)
+}
+
+prepare_dm_pvalues_by_sample_size <- function(dm_summary, loss = "squared") {
+  if (is.null(dm_summary) || nrow(dm_summary) == 0) return(NULL)
+  
+  dm_pvalues <- dm_summary[dm_summary$loss == loss, c(
+    "regime",
+    "sample_size",
+    "horizon",
+    "method_a",
+    "method_b",
+    "mean_dm_stat",
+    "mean_p_value",
+    "rejection_rate_5pct",
+    "share_favoring_method_a",
+    "share_favoring_method_b"
+  )]
+  
+  dm_pvalues <- dm_pvalues[order(
+    dm_pvalues$sample_size,
+    dm_pvalues$regime,
+    dm_pvalues$horizon,
+    dm_pvalues$method_a,
+    dm_pvalues$method_b
+  ), ]
+  rownames(dm_pvalues) <- NULL
+  dm_pvalues
+}
+
+print_dm_pvalues_by_sample_size <- function(dm_pvalues) {
+  if (is.null(dm_pvalues) || nrow(dm_pvalues) == 0) return(invisible(NULL))
+  
+  for (n_value in sort(unique(dm_pvalues$sample_size))) {
+    cat("\n")
+    cat("============================================================\n")
+    cat("Diebold-Mariano P-values | Sample size n =", n_value, "\n")
+    cat("Loss: squared error | Pairwise method tests\n")
+    cat("============================================================\n")
+    print(dm_pvalues[dm_pvalues$sample_size == n_value, ], row.names = FALSE)
+  }
+  
+  invisible(dm_pvalues)
 }
 
 summarize_dm <- function(dm_rows) {
@@ -647,8 +734,11 @@ summarize_dm <- function(dm_rows) {
       method_b = dat$method_b[1],
       loss = dat$loss[1],
       replications = nrow(dat),
-      mean_p_value = mean(dat$p_value, na.rm = TRUE),
-      rejection_rate_5pct = mean(dat$p_value < 0.05, na.rm = TRUE),
+      mean_dm_stat = mean(dat$dm_stat),
+      mean_p_value = mean(dat$p_value),
+      rejection_rate_5pct = mean(dat$significant_5pct),
+      share_favoring_method_a = mean(dat$favored_method == "method_a"),
+      share_favoring_method_b = mean(dat$favored_method == "method_b"),
       stringsAsFactors = FALSE
     )
   })
@@ -713,7 +803,7 @@ run_study <- function(config) {
         }
         
         message(sprintf(
-          "completed regime=%s, n=%s, replication=%s/%s",
+          "completed regime=%s, T=%s, replication=%s/%s",
           regime, sample_size, replication, config$replications
         ))
       }
@@ -723,19 +813,38 @@ run_study <- function(config) {
   detailed_metrics <- do.call(rbind, all_metrics)
   ranked_metrics <- rank_mean_metrics_by_regime(detailed_metrics)
   print_ranked_regime_tables(ranked_metrics)
+  best_models <- print_best_models_by_sample_size(ranked_metrics)
   
+  dm_pvalues <- NULL
   if (isTRUE(config$include_dm_tests) && length(all_dm) > 0) {
     dm_tests <- do.call(rbind, all_dm)
     dm_summary <- summarize_dm(dm_tests)
-    print_dm_benchmark_summary(dm_summary, benchmark = config$dm_benchmark)
+    dm_pvalues <- prepare_dm_pvalues_by_sample_size(dm_summary, loss = "squared")
+    print_dm_pvalues_by_sample_size(dm_pvalues)
   }
   
-  invisible(ranked_metrics)
+  invisible(list(
+    best_models_by_sample_size = best_models,
+    ranked_metrics_by_sample_size = ranked_metrics,
+    dm_pvalues_by_sample_size = dm_pvalues
+  ))
 }
 
 # To do a very small smoke test before the full run, uncomment these lines:
-CONFIG$sample_sizes <- c(100,300,500,700,1000)
-CONFIG$horizons <- c(1, 3, 6, 12)
-CONFIG$replications <- 50
+# CONFIG$sample_sizes <- c(200)
+# CONFIG$horizons <- c(1, 3)
+# CONFIG$replications <- 2
 
 results <- run_study(CONFIG)
+
+#Saving the output in excel
+library(writexl)
+
+write_xlsx(
+  list(
+    best_models_by_sample_size = results$best_models_by_sample_size,
+    ranked_metrics_by_sample_size = results$ranked_metrics_by_sample_size,
+    dm_pvalues_by_sample_size = results$dm_pvalues_by_sample_size
+  ),
+  path = "study_results.xlsx"
+)
